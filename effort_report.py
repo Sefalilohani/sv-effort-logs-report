@@ -2,6 +2,7 @@ import os
 import time
 import requests
 from datetime import datetime, timezone, timedelta
+from collections import defaultdict
 
 # ── CONFIG ─────────────────────────────────────────────────────
 
@@ -41,180 +42,71 @@ def fmt_date(dt):
 
 # ── FETCH REDASH DATA ─────────────────────────────────────────
 
-def _delete_temp_query(query_id, headers):
-    try:
-        requests.delete(
-            f"{REDASH_BASE}/api/queries/{query_id}",
-            headers=headers,
-            timeout=10
-        )
-        print(f"Temporary query {query_id} deleted")
-    except Exception as e:
-        print(f"Warning: Could not delete temp query {query_id}: {e}")
-
-
-def fetch_redash(sql):
+def fetch_redash():
     headers = {
         "Authorization": f"Key {REDASH_API_KEY}",
         "Content-Type": "application/json"
     }
 
-    # Step 1: Create temporary query
-    create_url = f"{REDASH_BASE}/api/queries"
-    create_payload = {
-        "name": "temp_effort_report",
-        "query": sql,
-        "data_source_id": 5,
-        "options": {"apply_auto_limit": False}
+    payload = {
+        "parameters": {
+            "Quick_Check": ["all"],
+            "Client_name": ["SELECT id FROM company WHERE id not in (28, 89, 74) and deleted_at is NULL"],
+            "Custom_Check_Type": [
+                "adverse_media_check", "corporate_affiliation_check", "directorship_check",
+                "do_not_use_education_check", "economic_default_check", "employment_details",
+                "face_match", "facis_level_3", "form_16", "form_26as", "gap_review",
+                "general_service_administration_check", "medical_test_electrocardiogram",
+                "medical_test_package_a", "medical_test_package_e", "medical_test_package_f",
+                "medical_test_pulmonary_function_test", "medical_test_ultrasound_abdomen",
+                "office_of_foreign_assets_control_ofac_check", "oig_exclusions", "other",
+                "overlap_check", "personal_reference_check", "personal_reference_check_2",
+                "police_clearance_certificate", "political_affiliation_check", "resume_review",
+                "right_to_work_india", "social_media_check", "social_media_lite",
+                "universal_account_number_check"
+            ],
+            "Min_Days_Since_Effort": 5,
+            "Net_TAT": ["'8-10(Yellow)'", "'11-14(Red)'", "'14+(Black)'"],
+            "result_limit": 4000
+        },
+        "max_age": 0
     }
-    print("Creating temporary Redash query...")
-    r = requests.post(create_url, headers=headers, json=create_payload, timeout=30)
-    print(f"Create query status: {r.status_code}")
+
+    url = f"{REDASH_BASE}/api/queries/1493/results"
+
+    print("Triggering Redash query 1493...")
+    r = requests.post(url, headers=headers, json=payload, timeout=30)
+    print(f"POST status: {r.status_code}")
+    if r.status_code not in (200, 201):
+        print(f"Response: {r.text[:500]}")
     r.raise_for_status()
-    query_id = r.json()["id"]
-    print(f"Temporary query created: id={query_id}")
+    resp = r.json()
 
-    # Step 2: Execute the query
-    exec_url = f"{REDASH_BASE}/api/queries/{query_id}/results"
-    exec_payload = {"max_age": 0}
-
-    print("Executing query...")
-    r2 = requests.post(exec_url, headers=headers, json=exec_payload, timeout=30)
-    print(f"POST status: {r2.status_code}")
-    if r2.status_code not in (200, 201):
-        print(f"Response: {r2.text[:500]}")
-    r2.raise_for_status()
-    resp = r2.json()
-
-    # Immediate result
     if "query_result" in resp:
         rows = resp["query_result"]["data"]["rows"]
         print(f"Got immediate result: {len(rows)} rows")
-        _delete_temp_query(query_id, headers)
         return rows
 
-    # Job queued — poll
     job_id = resp.get("job", {}).get("id", "unknown")
     print(f"Query job queued (id={job_id}), polling for result...")
-    poll_payload = {"max_age": 60}
+    poll_payload = {**payload, "max_age": 60}
 
     for attempt in range(20):
         time.sleep(3)
         print(f"  Poll attempt {attempt + 1}/20...")
-        r3 = requests.post(exec_url, headers=headers, json=poll_payload, timeout=30)
-        if r3.status_code not in (200, 201):
-            print(f"  Poll status {r3.status_code}: {r3.text[:200]}")
+        r2 = requests.post(url, headers=headers, json=poll_payload, timeout=30)
+        if r2.status_code not in (200, 201):
+            print(f"  Poll status {r2.status_code}: {r2.text[:200]}")
             continue
-        resp3 = r3.json()
-        if "query_result" in resp3:
-            rows = resp3["query_result"]["data"]["rows"]
+        resp2 = r2.json()
+        if "query_result" in resp2:
+            rows = resp2["query_result"]["data"]["rows"]
             print(f"  Got result: {len(rows)} rows")
-            _delete_temp_query(query_id, headers)
             return rows
-        new_job = resp3.get("job", {})
+        new_job = resp2.get("job", {})
         print(f"  Still running, job status={new_job.get('status')}")
 
-    _delete_temp_query(query_id, headers)
     raise Exception("Timed out waiting for Redash query result after 60 seconds")
-
-
-# ── SQL QUERIES ───────────────────────────────────────────────
-
-PIVOT_SQL = (
-    "SELECT "
-    "  comp.company_type AS 'Client Priority', "
-    "  COALESCE(cct.display_name, cn.name) AS 'Check Type', "
-    "  COUNT(DISTINCT cd.check_id) AS 'Count', "
-    "  MIN(el.last_effort_date) AS 'From Date' "
-    "FROM company_candidate_mapping ccm "
-    "INNER JOIN candidates c ON c.id = ccm.candidate_id AND c.deleted_at IS NULL "
-    "INNER JOIN company comp ON comp.id = ccm.company_id AND comp.deleted_at IS NULL "
-    "INNER JOIN (SELECT DISTINCT company_id_fk FROM payments_company_packages WHERE deleted_at IS NULL) pcp ON pcp.company_id_fk = comp.id "
-    "INNER JOIN ( "
-    "  SELECT candidate_id_fk AS candidate_id, id AS check_id, (SELECT id FROM check_names WHERE name='identity') AS check_name_id, NULL AS custom_check_type_fk FROM candidates_ids WHERE deleted_at IS NULL AND status IN (0,4,9) "
-    "  UNION ALL SELECT candidate_id_fk, id, (SELECT id FROM check_names WHERE name='address'), NULL FROM candidates_address WHERE deleted_at IS NULL AND status IN (0,4,9) "
-    "  UNION ALL SELECT candidate_id_fk, id, (SELECT id FROM check_names WHERE name='court'), NULL FROM candidate_history WHERE deleted_at IS NULL AND status IN (0,4,9) "
-    "  UNION ALL SELECT candidate_id_fk, id, (SELECT id FROM check_names WHERE name='education'), NULL FROM candidates_education WHERE deleted_at IS NULL AND status IN (0,4,9) "
-    "  UNION ALL SELECT candidate_id_fk, id, (SELECT id FROM check_names WHERE name='employment'), NULL FROM candidates_employment WHERE deleted_at IS NULL AND status IN (0,4,9) "
-    "  UNION ALL SELECT candidate_id_fk, id, (SELECT id FROM check_names WHERE name='reference'), NULL FROM candidates_refcheck WHERE deleted_at IS NULL AND status IN (0,4,9) "
-    "  UNION ALL SELECT cc.candidate_id_fk, cc.id, (SELECT id FROM check_names WHERE name='custom'), cc.custom_check_type_fk FROM custom_check cc WHERE cc.deleted_at IS NULL AND cc.status IN (0,4,9) "
-    "  UNION ALL SELECT candidate_id_fk, id, (SELECT id FROM check_names WHERE name='credit'), NULL FROM candidates_creditcheck WHERE deleted_at IS NULL AND status IN (0,4,9) "
-    "  UNION ALL SELECT candidate_id_fk, id, (SELECT id FROM check_names WHERE name='drug'), NULL FROM candidate_drugs WHERE deleted_at IS NULL AND status IN (0,4,9) "
-    "  UNION ALL SELECT candidate_id_fk, id, (SELECT id FROM check_names WHERE name='world'), NULL FROM candidates_worldcheck WHERE deleted_at IS NULL AND status IN (0,4,9) "
-    ") cd ON cd.candidate_id = ccm.candidate_id "
-    "INNER JOIN check_names cn ON cn.id = cd.check_name_id "
-    "LEFT JOIN custom_check_types cct ON cct.id = cd.custom_check_type_fk "
-    "LEFT JOIN candidate_checks_tat_v2 tat ON tat.candidate_id = ccm.candidate_id AND tat.check_id = cd.check_id "
-    "LEFT JOIN ( "
-    "  SELECT cecl.candidate_id_fk, cecl.check_id_fk, cecl.check_name_id_fk, "
-    "    MAX(cecl.created_at) AS last_effort_date, "
-    "    DATEDIFF(NOW(), MAX(cecl.created_at)) AS days_since_last_effort, "
-    "    SUBSTRING_INDEX(GROUP_CONCAT(ccem.mode ORDER BY cecl.created_at DESC),',',1) AS last_effort_mode "
-    "  FROM candidates_check_effort_logs cecl "
-    "  LEFT JOIN candidates_check_effort_modes ccem ON ccem.id = cecl.effort_mode_id_fk "
-    "  WHERE cecl.deleted_at IS NULL "
-    "  GROUP BY cecl.candidate_id_fk, cecl.check_id_fk, cecl.check_name_id_fk "
-    ") el ON el.candidate_id_fk = ccm.candidate_id AND el.check_id_fk = cd.check_id AND el.check_name_id_fk = cd.check_name_id "
-    "LEFT JOIN payments_company_insuff_funds pcif ON pcif.candidate_id_fk = ccm.candidate_id AND pcif.check_id_fk = cd.check_id AND pcif.status = 'OPEN' AND pcif.deleted_at IS NULL "
-    "WHERE ccm.deleted_at IS NULL "
-    "  AND ccm.company_id NOT IN (28, 878) "
-    "  AND ccm.status NOT IN (9,10,11,12) "
-    "  AND pcif.id IS NULL "
-    "  AND (el.last_effort_mode IS NULL OR el.last_effort_mode != 'Insuff_Raised') "
-    "  AND (el.days_since_last_effort IS NULL OR el.days_since_last_effort >= 5) "
-    "  AND CASE "
-    "    WHEN FLOOR(tat.actual_net_tat_net) BETWEEN 8 AND 10 THEN '8-10(Yellow)' "
-    "    WHEN FLOOR(tat.actual_net_tat_net) BETWEEN 11 AND 14 THEN '11-14(Red)' "
-    "    WHEN FLOOR(tat.actual_net_tat_net) > 14 THEN '14+(Black)' "
-    "    ELSE NULL "
-    "  END IS NOT NULL "
-    "GROUP BY comp.company_type, COALESCE(cct.display_name, cn.name) "
-    "ORDER BY comp.company_type, COALESCE(cct.display_name, cn.name)"
-)
-
-FROM_DATE_SQL = (
-    "SELECT MIN(el.last_effort_date) AS 'From Date' "
-    "FROM company_candidate_mapping ccm "
-    "INNER JOIN candidates c ON c.id = ccm.candidate_id AND c.deleted_at IS NULL "
-    "INNER JOIN company comp ON comp.id = ccm.company_id AND comp.deleted_at IS NULL "
-    "INNER JOIN (SELECT DISTINCT company_id_fk FROM payments_company_packages WHERE deleted_at IS NULL) pcp ON pcp.company_id_fk = comp.id "
-    "INNER JOIN ( "
-    "  SELECT candidate_id_fk AS candidate_id, id AS check_id, (SELECT id FROM check_names WHERE name='identity') AS check_name_id FROM candidates_ids WHERE deleted_at IS NULL AND status IN (0,4,9) "
-    "  UNION ALL SELECT candidate_id_fk, id, (SELECT id FROM check_names WHERE name='address') FROM candidates_address WHERE deleted_at IS NULL AND status IN (0,4,9) "
-    "  UNION ALL SELECT candidate_id_fk, id, (SELECT id FROM check_names WHERE name='court') FROM candidate_history WHERE deleted_at IS NULL AND status IN (0,4,9) "
-    "  UNION ALL SELECT candidate_id_fk, id, (SELECT id FROM check_names WHERE name='education') FROM candidates_education WHERE deleted_at IS NULL AND status IN (0,4,9) "
-    "  UNION ALL SELECT candidate_id_fk, id, (SELECT id FROM check_names WHERE name='employment') FROM candidates_employment WHERE deleted_at IS NULL AND status IN (0,4,9) "
-    "  UNION ALL SELECT candidate_id_fk, id, (SELECT id FROM check_names WHERE name='reference') FROM candidates_refcheck WHERE deleted_at IS NULL AND status IN (0,4,9) "
-    "  UNION ALL SELECT cc.candidate_id_fk, cc.id, (SELECT id FROM check_names WHERE name='custom') FROM custom_check cc WHERE cc.deleted_at IS NULL AND cc.status IN (0,4,9) "
-    "  UNION ALL SELECT candidate_id_fk, id, (SELECT id FROM check_names WHERE name='credit') FROM candidates_creditcheck WHERE deleted_at IS NULL AND status IN (0,4,9) "
-    "  UNION ALL SELECT candidate_id_fk, id, (SELECT id FROM check_names WHERE name='drug') FROM candidate_drugs WHERE deleted_at IS NULL AND status IN (0,4,9) "
-    "  UNION ALL SELECT candidate_id_fk, id, (SELECT id FROM check_names WHERE name='world') FROM candidates_worldcheck WHERE deleted_at IS NULL AND status IN (0,4,9) "
-    ") cd ON cd.candidate_id = ccm.candidate_id "
-    "LEFT JOIN candidate_checks_tat_v2 tat ON tat.candidate_id = ccm.candidate_id AND tat.check_id = cd.check_id "
-    "LEFT JOIN ( "
-    "  SELECT cecl.candidate_id_fk, cecl.check_id_fk, cecl.check_name_id_fk, "
-    "    MAX(cecl.created_at) AS last_effort_date, "
-    "    DATEDIFF(NOW(), MAX(cecl.created_at)) AS days_since_last_effort, "
-    "    SUBSTRING_INDEX(GROUP_CONCAT(ccem.mode ORDER BY cecl.created_at DESC),',',1) AS last_effort_mode "
-    "  FROM candidates_check_effort_logs cecl "
-    "  LEFT JOIN candidates_check_effort_modes ccem ON ccem.id = cecl.effort_mode_id_fk "
-    "  WHERE cecl.deleted_at IS NULL "
-    "  GROUP BY cecl.candidate_id_fk, cecl.check_id_fk, cecl.check_name_id_fk "
-    ") el ON el.candidate_id_fk = ccm.candidate_id AND el.check_id_fk = cd.check_id AND el.check_name_id_fk = cd.check_name_id "
-    "LEFT JOIN payments_company_insuff_funds pcif ON pcif.candidate_id_fk = ccm.candidate_id AND pcif.check_id_fk = cd.check_id AND pcif.status = 'OPEN' AND pcif.deleted_at IS NULL "
-    "WHERE ccm.deleted_at IS NULL "
-    "  AND ccm.company_id NOT IN (28, 878) "
-    "  AND ccm.status NOT IN (9,10,11,12) "
-    "  AND pcif.id IS NULL "
-    "  AND (el.last_effort_mode IS NULL OR el.last_effort_mode != 'Insuff_Raised') "
-    "  AND (el.days_since_last_effort IS NULL OR el.days_since_last_effort >= 5) "
-    "  AND CASE "
-    "    WHEN FLOOR(tat.actual_net_tat_net) BETWEEN 8 AND 10 THEN '8-10(Yellow)' "
-    "    WHEN FLOOR(tat.actual_net_tat_net) BETWEEN 11 AND 14 THEN '11-14(Red)' "
-    "    WHEN FLOOR(tat.actual_net_tat_net) > 14 THEN '14+(Black)' "
-    "    ELSE NULL "
-    "  END IS NOT NULL"
-)
 
 # ── POST TO SLACK ──────────────────────────────────────────────
 
@@ -268,16 +160,31 @@ def find_9am_thread_ts():
 # ── BUILD PIVOT TABLE ──────────────────────────────────────────
 
 def build_pivot_table(rows):
-    check_types = sorted(set(r["Check Type"] for r in rows))
-    priorities = sorted(set(r["Client Priority"] for r in rows))
+    # Aggregate raw rows into pivot: Client Priority x Check Type
+    pivot = defaultdict(lambda: defaultdict(int))
+    from_dates = []
 
-    data = {}
     for row in rows:
-        data[(row["Client Priority"], row["Check Type"])] = row["Count"]
+        priority = row.get("Client Priority") or "Unknown"
+        check_type = row.get("Check Type") or "Unknown"
+        pivot[priority][check_type] += 1
 
-    priority_totals = {p: sum(data.get((p, ct), 0) for ct in check_types) for p in priorities}
-    col_totals = {ct: sum(data.get((p, ct), 0) for p in priorities) for ct in check_types}
-    grand_total = sum(col_totals.values())
+        raw_date = row.get("Last Effort Log Date")
+        if raw_date:
+            try:
+                dt = datetime.strptime(str(raw_date)[:19], "%Y-%m-%dT%H:%M:%S")
+                from_dates.append(dt)
+            except ValueError:
+                pass
+
+    from_date = min(from_dates) if from_dates else None
+
+    priorities = sorted(pivot.keys())
+    check_types = sorted(set(ct for p in pivot.values() for ct in p.keys()))
+
+    priority_totals = {p: sum(pivot[p].values()) for p in priorities}
+    col_totals = {ct: sum(pivot[p].get(ct, 0) for p in priorities) for ct in check_types}
+    grand_total = sum(priority_totals.values())
 
     p_width = 16
     ct_width = max(9, max(len(ct) for ct in check_types) + 2)
@@ -289,7 +196,7 @@ def build_pivot_table(rows):
     for p in priorities:
         line = f"{p:<{p_width}}"
         for ct in check_types:
-            val = data.get((p, ct), 0)
+            val = pivot[p].get(ct, 0)
             line += f"{val if val else '-':>{ct_width}}"
         line += f"{priority_totals[p]:>8}"
         lines.append(line)
@@ -299,22 +206,17 @@ def build_pivot_table(rows):
     lines.append(totals_line)
     lines.append("```")
 
-    return "\n".join(lines), grand_total
+    return "\n".join(lines), grand_total, from_date
 
 # ── BUILD REPORT ───────────────────────────────────────────────
 
-def build_report(pivot_rows, from_date_rows, report_type):
+def build_report(rows, report_type):
     now = datetime.now(IST)
     today_str = fmt_date(now)
 
-    from_date_raw = from_date_rows[0].get("From Date") if from_date_rows else None
-    if from_date_raw:
-        from_dt = datetime.strptime(str(from_date_raw)[:19], "%Y-%m-%dT%H:%M:%S")
-        from_date_str = fmt_date(from_dt)
-    else:
-        from_date_str = "N/A"
+    table_text, grand_total, from_date = build_pivot_table(rows)
 
-    table_text, grand_total = build_pivot_table(pivot_rows)
+    from_date_str = fmt_date(from_date) if from_date else "N/A"
 
     if report_type == "9am":
         heading = f"📋 *Effort Log Report — Missing or Outdated as of {today_str}*"
@@ -337,13 +239,11 @@ def build_report(pivot_rows, from_date_rows, report_type):
 def run_report():
     print(f"Report type: {REPORT_TYPE}")
 
-    print("Fetching pivot data...")
-    pivot_rows = fetch_redash(PIVOT_SQL)
+    print("Fetching Redash data...")
+    rows = fetch_redash()
+    print(f"Got {len(rows)} rows")
 
-    print("Fetching from date...")
-    from_date_rows = fetch_redash(FROM_DATE_SQL)
-
-    message = build_report(pivot_rows, from_date_rows, REPORT_TYPE)
+    message = build_report(rows, REPORT_TYPE)
 
     if REPORT_TYPE == "9am":
         print("Posting new Slack message (9:30 AM effort report)")
