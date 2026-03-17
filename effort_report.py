@@ -12,7 +12,7 @@ SLACK_TOKEN = "xoxb" + _raw_token[4:31] + "bFqMGfkmHBzvLRtU1It2ptnt"
 REDASH_API_KEY = "hRWTnaq2Qgk274jXYszPW3U9Cqzyjt20WbcARosl"
 REDASH_BASE = "https://redash.springworks.in"
 
-OPS_CHANNEL_ID = "C0AGRE19V6U"  # testing-sefali
+OPS_CHANNEL_ID = "CF0RH10M8"  # sv-in-ops
 
 REPORT_TYPE = os.environ.get("REPORT_TYPE", "9am")
 THREAD_FILE = "effort_thread_ts.txt"
