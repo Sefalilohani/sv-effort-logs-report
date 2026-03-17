@@ -39,7 +39,86 @@ def ordinal(n):
 def fmt_date(dt):
     return f"{ordinal(dt.day)} {dt.strftime('%B %Y')}"
 
-# ── FETCH PIVOT DATA ──────────────────────────────────────────
+# ── FETCH REDASH DATA ─────────────────────────────────────────
+
+def _delete_temp_query(query_id, headers):
+    try:
+        requests.delete(
+            f"{REDASH_BASE}/api/queries/{query_id}",
+            headers=headers,
+            timeout=10
+        )
+        print(f"Temporary query {query_id} deleted")
+    except Exception as e:
+        print(f"Warning: Could not delete temp query {query_id}: {e}")
+
+
+def fetch_redash(sql):
+    headers = {
+        "Authorization": f"Key {REDASH_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    # Step 1: Create temporary query
+    create_url = f"{REDASH_BASE}/api/queries"
+    create_payload = {
+        "name": "temp_effort_report",
+        "query": sql,
+        "data_source_id": 5,
+        "options": {"apply_auto_limit": False}
+    }
+    print("Creating temporary Redash query...")
+    r = requests.post(create_url, headers=headers, json=create_payload, timeout=30)
+    print(f"Create query status: {r.status_code}")
+    r.raise_for_status()
+    query_id = r.json()["id"]
+    print(f"Temporary query created: id={query_id}")
+
+    # Step 2: Execute the query
+    exec_url = f"{REDASH_BASE}/api/queries/{query_id}/results"
+    exec_payload = {"max_age": 0}
+
+    print("Executing query...")
+    r2 = requests.post(exec_url, headers=headers, json=exec_payload, timeout=30)
+    print(f"POST status: {r2.status_code}")
+    if r2.status_code not in (200, 201):
+        print(f"Response: {r2.text[:500]}")
+    r2.raise_for_status()
+    resp = r2.json()
+
+    # Immediate cached result
+    if "query_result" in resp:
+        rows = resp["query_result"]["data"]["rows"]
+        print(f"Got immediate result: {len(rows)} rows")
+        _delete_temp_query(query_id, headers)
+        return rows
+
+    # Job queued — poll by re-POSTing with max_age=60
+    job_id = resp.get("job", {}).get("id", "unknown")
+    print(f"Query job queued (id={job_id}), polling for result...")
+    poll_payload = {"max_age": 60}
+
+    for attempt in range(20):
+        time.sleep(3)
+        print(f"  Poll attempt {attempt + 1}/20...")
+        r3 = requests.post(exec_url, headers=headers, json=poll_payload, timeout=30)
+        if r3.status_code not in (200, 201):
+            print(f"  Poll status {r3.status_code}: {r3.text[:200]}")
+            continue
+        resp3 = r3.json()
+        if "query_result" in resp3:
+            rows = resp3["query_result"]["data"]["rows"]
+            print(f"  Got result: {len(rows)} rows")
+            _delete_temp_query(query_id, headers)
+            return rows
+        new_job = resp3.get("job", {})
+        print(f"  Still running, job status={new_job.get('status')}")
+
+    _delete_temp_query(query_id, headers)
+    raise Exception("Timed out waiting for Redash query result after 60 seconds")
+
+
+# ── SQL QUERIES ───────────────────────────────────────────────
 
 PIVOT_SQL = """
 SELECT 
@@ -131,199 +210,4 @@ WHERE ccm.deleted_at IS NULL
   AND (el.days_since_last_effort IS NULL OR el.days_since_last_effort >= 5)
   AND CASE
     WHEN FLOOR(tat.actual_net_tat_net) BETWEEN 8 AND 10 THEN '8-10(Yellow)'
-    WHEN FLOOR(tat.actual_net_tat_net) BETWEEN 11 AND 14 THEN '11-14(Red)'
-    WHEN FLOOR(tat.actual_net_tat_net) > 14 THEN '14+(Black)'
-    ELSE NULL
-  END IS NOT NULL
-"""
-
-def fetch_redash(sql):
-    headers = {"Authorization": f"Key {REDASH_API_KEY}", "Content-Type": "application/json"}
-    payload = {"data_source_id": 5, "query": sql, "max_age": 0}
-    url = f"{REDASH_BASE}/api/query_results"
-
-    print("Fetching Redash data...")
-    r = requests.post(url, headers=headers, json=payload, timeout=30)
-    r.raise_for_status()
-    resp = r.json()
-
-    if "query_result" in resp:
-        rows = resp["query_result"]["data"]["rows"]
-        print(f"Got immediate result: {len(rows)} rows")
-        return rows
-
-    job_id = resp.get("job", {}).get("id", "unknown")
-    print(f"Query queued (id={job_id}), polling...")
-
-    for attempt in range(20):
-        time.sleep(3)
-        print(f"  Poll attempt {attempt + 1}/20...")
-        r2 = requests.post(url, headers=headers, json={**payload, "max_age": 60}, timeout=30)
-        if r2.status_code not in (200, 201):
-            continue
-        resp2 = r2.json()
-        if "query_result" in resp2:
-            rows = resp2["query_result"]["data"]["rows"]
-            print(f"  Got result: {len(rows)} rows")
-            return rows
-        print(f"  Still running...")
-
-    raise Exception("Timed out waiting for Redash query result")
-
-# ── POST TO SLACK ──────────────────────────────────────────────
-
-def post_slack(text, thread_ts=None):
-    payload = {"channel": OPS_CHANNEL_ID, "text": text}
-    if thread_ts:
-        payload["thread_ts"] = thread_ts
-    r = requests.post(
-        "https://slack.com/api/chat.postMessage",
-        headers={"Authorization": f"Bearer {SLACK_TOKEN}", "Content-Type": "application/json"},
-        json=payload
-    )
-    r.raise_for_status()
-    resp = r.json()
-    if not resp.get("ok"):
-        raise Exception(f"Slack API error: {resp.get('error')}")
-    return resp["ts"]
-
-# ── FIND 9:30AM THREAD ─────────────────────────────────────────
-
-def find_9am_thread_ts():
-    if os.path.exists(THREAD_FILE):
-        with open(THREAD_FILE) as f:
-            ts = f.read().strip()
-            if ts:
-                print(f"Found thread ts from file: {ts}")
-                return ts
-
-    now = datetime.now(IST)
-    today_start = datetime(now.year, now.month, now.day, 0, 0, 0, tzinfo=IST).timestamp()
-
-    r = requests.get(
-        "https://slack.com/api/conversations.history",
-        headers={"Authorization": f"Bearer {SLACK_TOKEN}"},
-        params={"channel": OPS_CHANNEL_ID, "oldest": str(today_start), "limit": 50}
-    )
-    data = r.json()
-    if not data.get("ok"):
-        raise Exception(f"Slack history error: {data.get('error')}")
-
-    for msg in data.get("messages", []):
-        if "Effort Log Report" in msg.get("text", ""):
-            ts = msg["ts"]
-            print(f"Found today's effort report thread: {ts}")
-            with open(THREAD_FILE, "w") as f:
-                f.write(ts)
-            return ts
-
-    raise Exception("Could not find today's 9:30 AM effort report thread.")
-
-# ── BUILD PIVOT TABLE ──────────────────────────────────────────
-
-def build_pivot_table(rows):
-    check_types = sorted(set(r["Check Type"] for r in rows))
-    priorities = sorted(set(r["Client Priority"] for r in rows))
-
-    data = {}
-    from_dates = []
-    for row in rows:
-        data[(row["Client Priority"], row["Check Type"])] = row["Count"]
-        if row.get("From Date"):
-            try:
-                dt = datetime.strptime(str(row["From Date"])[:19], "%Y-%m-%dT%H:%M:%S")
-                from_dates.append(dt)
-            except ValueError:
-                pass
-
-    priority_totals = {p: sum(data.get((p, ct), 0) for ct in check_types) for p in priorities}
-    col_totals = {ct: sum(data.get((p, ct), 0) for p in priorities) for ct in check_types}
-    grand_total = sum(col_totals.values())
-
-    # Column widths
-    p_width = 16
-    ct_width = max(9, max(len(ct) for ct in check_types) + 2)
-
-    header = f"{'Client Priority':<{p_width}}" + "".join(f"{ct:>{ct_width}}" for ct in check_types) + f"{'Total':>8}"
-    separator = "─" * len(header)
-
-    lines = ["```", header, separator]
-    for p in priorities:
-        line = f"{p:<{p_width}}"
-        for ct in check_types:
-            val = data.get((p, ct), 0)
-            line += f"{val if val else '-':>{ct_width}}"
-        line += f"{priority_totals[p]:>8}"
-        lines.append(line)
-
-    lines.append(separator)
-    totals_line = f"{'Total':<{p_width}}" + "".join(f"{col_totals[ct]:>{ct_width}}" for ct in check_types) + f"{grand_total:>8}"
-    lines.append(totals_line)
-    lines.append("```")
-
-    return "\n".join(lines), grand_total
-
-# ── BUILD REPORT ───────────────────────────────────────────────
-
-def build_report(pivot_rows, from_date_rows, report_type):
-    now = datetime.now(IST)
-    today_str = fmt_date(now)
-
-    # From date
-    from_date_raw = from_date_rows[0].get("From Date") if from_date_rows else None
-    if from_date_raw:
-        from_dt = datetime.strptime(str(from_date_raw)[:19], "%Y-%m-%dT%H:%M:%S")
-        from_date_str = fmt_date(from_dt)
-    else:
-        from_date_str = "N/A"
-
-    table_text, grand_total = build_pivot_table(pivot_rows)
-
-    if report_type == "9am":
-        heading = f"📋 *Effort Log Report — Missing or Outdated as of {today_str}*"
-    else:
-        heading = f"📋 *Updated Effort Log Report — Missing or Outdated as of {today_str}*"
-
-    text = (
-        f"{heading}\n"
-        f"*Min. 5 Days Since Last Effort | NET TAT — 7+ days*\n"
-        f"*From Date: {from_date_str}*\n\n"
-        f"{table_text}\n\n"
-        f"*Total Checks: {grand_total}*\n"
-        f"📊 <{REDASH_URL}|View Full Report on Redash>\n\n"
-        f"<!subteam^S04K9859L64> Please review and update effort logs for all pending checks at the earliest."
-    )
-    return text
-
-# ── MAIN ───────────────────────────────────────────────────────
-
-def run_report():
-    print(f"Report type: {REPORT_TYPE}")
-
-    print("Fetching pivot data...")
-    pivot_rows = fetch_redash(PIVOT_SQL)
-
-    print("Fetching from date...")
-    from_date_rows = fetch_redash(FROM_DATE_SQL)
-
-    message = build_report(pivot_rows, from_date_rows, REPORT_TYPE)
-
-    if REPORT_TYPE == "9am":
-        print("Posting new Slack message (9:30 AM effort report)")
-        ts = post_slack(message)
-        with open(THREAD_FILE, "w") as f:
-            f.write(ts)
-        print(f"Posted. Thread ts: {ts}")
-    else:
-        print(f"Replying in thread (4 PM effort report)")
-        try:
-            ts = find_9am_thread_ts()
-            post_slack(message, ts)
-            print(f"Replied in thread: {ts}")
-        except Exception as e:
-            print(f"Warning: Could not find 9:30 AM thread ({e}). Posting as new message.")
-            ts = post_slack(message)
-            print(f"Posted as new message. ts: {ts}")
-
-if __name__ == "__main__":
-    run_report()
+    WHEN FLOOR(tat.actual_net_tat_net)
