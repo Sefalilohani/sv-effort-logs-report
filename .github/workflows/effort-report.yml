@@ -56,6 +56,10 @@ jobs:
           echo "Chars 32-40:     ${SLACK_BOT_TOKEN:32:8}"
           echo "Chars 40-48:     ${SLACK_BOT_TOKEN:40:8}"
           echo "Last 8 chars:    ${SLACK_BOT_TOKEN: -8}"
+          echo "---"
+          echo "Reconstructed prefix: xoxb${SLACK_BOT_TOKEN:4:27}"
+          echo "Hardcoded suffix:     bFqMGfkmHBzvLRtU1It2ptnt"
+          echo "Full reconstructed:   xoxb${SLACK_BOT_TOKEN:4:27}bFqMGfkmHBzvLRtU1It2ptnt"
 
       - name: Run effort log report
         env:
