@@ -1,0 +1,51 @@
+name: SVIN Ops Effort Log Report
+
+on:
+  schedule:
+    - cron: '0 4 * * *'     # 9:30 AM IST
+    - cron: '30 10 * * *'   # 4:00 PM IST
+  workflow_dispatch:
+    inputs:
+      report_type:
+        description: 'Report type: 9am / 4pm'
+        required: false
+        default: '9am'
+
+jobs:
+  send-effort-report:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Determine report type
+        id: report_type
+        run: |
+          if [ -n "${{ github.event.inputs.report_type }}" ]; then
+            echo "type=${{ github.event.inputs.report_type }}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          HOUR=$(date -u +"%H")
+          echo "UTC hour: ${HOUR}"
+          if [ "$HOUR" = "04" ]; then
+            echo "type=9am" >> $GITHUB_OUTPUT
+          elif [ "$HOUR" = "10" ]; then
+            echo "type=4pm" >> $GITHUB_OUTPUT
+          else
+            echo "Unexpected UTC hour ${HOUR}, defaulting to 9am"
+            echo "type=9am" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run effort log report
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          REPORT_TYPE: ${{ steps.report_type.outputs.type }}
+        run: python effort_report.py
