@@ -65,6 +65,7 @@ def fetch_redash():
                 "right_to_work_india", "social_media_check", "social_media_lite",
                 "universal_account_number_check"
             ],
+            "Task_Type": ["all"], 
             "Min_Days_Since_Effort": 5,
             "Net_TAT": ["'8-10(Yellow)'", "'11-14(Red)'", "'14+(Black)'"],
             "result_limit": 4000
