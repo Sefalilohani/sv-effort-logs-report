@@ -2,14 +2,8 @@ name: SVIN Ops Effort Log Report
 
 on:
   schedule:
-    - cron: '30 3 * * *'    # 9:00 AM IST (fallback)
-    - cron: '30 10 * * *'   # 4:00 PM IST (fallback)
+    - cron: '30 3 * * *'    # 9:00 AM IST
   workflow_dispatch:
-    inputs:
-      report_type:
-        description: 'Report type: 9am / 4pm'
-        required: false
-        default: '9am'
   repository_dispatch:
     types: [run-effort-report]
 
