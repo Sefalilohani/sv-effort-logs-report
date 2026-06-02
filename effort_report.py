@@ -14,20 +14,18 @@ REDASH_BASE = "https://redash.springworks.in"
 
 OPS_CHANNEL_ID = "CF0RH10M8"  # sv-in-ops
 
-REPORT_TYPE = os.environ.get("REPORT_TYPE", "9am")
-THREAD_FILE = "effort_thread_ts.txt"
-
 IST = timezone(timedelta(hours=5, minutes=30))
 
 REDASH_URL = (
     "https://redash.springworks.in/queries/1493"
     "?p_Client_name=%5B%22SELECT%20id%20FROM%20company%20WHERE%20id%20not%20in%20%2828%2C%2089%2C%2074%29%20and%20deleted_at%20is%20NULL%22%5D"
     "&p_Custom_Check_Type=%5B%22adverse_media_check%22%2C%22corporate_affiliation_check%22%2C%22directorship_check%22%2C%22do_not_use_education_check%22%2C%22economic_default_check%22%2C%22employment_details%22%2C%22face_match%22%2C%22facis_level_3%22%2C%22form_16%22%2C%22form_26as%22%2C%22gap_review%22%2C%22general_service_administration_check%22%2C%22medical_test_electrocardiogram%22%2C%22medical_test_package_a%22%2C%22medical_test_package_e%22%2C%22medical_test_package_f%22%2C%22medical_test_pulmonary_function_test%22%2C%22medical_test_ultrasound_abdomen%22%2C%22office_of_foreign_assets_control_ofac_check%22%2C%22oig_exclusions%22%2C%22other%22%2C%22overlap_check%22%2C%22personal_reference_check%22%2C%22personal_reference_check_2%22%2C%22police_clearance_certificate%22%2C%22political_affiliation_check%22%2C%22resume_review%22%2C%22right_to_work_india%22%2C%22social_media_check%22%2C%22social_media_lite%22%2C%22universal_account_number_check%22%5D"
-    "&p_Min_Days_Since_Effort=5"
-    "&p_Net_TAT=%5B%22%278-10%28Yellow%29%27%22%2C%22%2711-14%28Red%29%27%22%2C%22%2714%2B%28Black%29%27%22%5D"
+    "&p_Min_Days_Since_Effort=14"
+    "&p_Net_TAT=%5B%22%2714%2B%28Black%29%27%22%5D"
     "&p_Quick_Check=%5B%22all%22%5D"
+    "&p_Task_Type=%5B%22ALL%22%5D"
     "&p_result_limit=4000"
-    "#2553"
+    "#2555"
 )
 
 # ── HELPERS ────────────────────────────────────────────────────
@@ -66,8 +64,8 @@ def fetch_redash():
                 "universal_account_number_check"
             ],
             "Task_Type": ["ALL"], 
-            "Min_Days_Since_Effort": 5,
-            "Net_TAT": ["'8-10(Yellow)'", "'11-14(Red)'", "'14+(Black)'"],
+            "Min_Days_Since_Effort": 14,
+            "Net_TAT": ["'14+(Black)'"],
             "result_limit": 4000
         },
         "max_age": 0
@@ -126,38 +124,6 @@ def post_slack(text, thread_ts=None):
         raise Exception(f"Slack API error: {resp.get('error')}")
     return resp["ts"]
 
-# ── FIND 9:30AM THREAD ─────────────────────────────────────────
-
-def find_9am_thread_ts():
-    if os.path.exists(THREAD_FILE):
-        with open(THREAD_FILE) as f:
-            ts = f.read().strip()
-            if ts:
-                print(f"Found thread ts from file: {ts}")
-                return ts
-
-    now = datetime.now(IST)
-    today_start = datetime(now.year, now.month, now.day, 0, 0, 0, tzinfo=IST).timestamp()
-
-    r = requests.get(
-        "https://slack.com/api/conversations.history",
-        headers={"Authorization": f"Bearer {SLACK_TOKEN}"},
-        params={"channel": OPS_CHANNEL_ID, "oldest": str(today_start), "limit": 50}
-    )
-    data = r.json()
-    if not data.get("ok"):
-        raise Exception(f"Slack history error: {data.get('error')}")
-
-    for msg in data.get("messages", []):
-        if "Effort Log Report" in msg.get("text", ""):
-            ts = msg["ts"]
-            print(f"Found today's effort report thread: {ts}")
-            with open(THREAD_FILE, "w") as f:
-                f.write(ts)
-            return ts
-
-    raise Exception("Could not find today's 9:30 AM effort report thread.")
-
 # ── BUILD PIVOT TABLE ──────────────────────────────────────────
 
 def build_pivot_table(rows):
@@ -211,7 +177,7 @@ def build_pivot_table(rows):
 
 # ── BUILD REPORT ───────────────────────────────────────────────
 
-def build_report(rows, report_type):
+def build_report(rows):
     now = datetime.now(IST)
     today_str = fmt_date(now)
 
@@ -219,14 +185,11 @@ def build_report(rows, report_type):
 
     from_date_str = fmt_date(from_date) if from_date else "N/A"
 
-    if report_type == "9am":
-        heading = f"📋 *Effort Log Report — Missing or Outdated as of {today_str}*"
-    else:
-        heading = f"📋 *Updated Effort Log Report — Missing or Outdated as of {today_str}*"
+    heading = f"📋 *Effort Log Report — Missing or Outdated as of {today_str}*"
 
     text = (
         f"{heading}\n"
-        f"*Min. 5 Days Since Last Effort | NET TAT — 7+ days*\n"
+        f"*Min. 14 Days Since Last Effort | NET TAT — 14+ days*\n"
         f"*From Date: {from_date_str}*\n\n"
         f"{table_text}\n\n"
         f"*Total Checks: {grand_total}*\n"
@@ -238,30 +201,15 @@ def build_report(rows, report_type):
 # ── MAIN ───────────────────────────────────────────────────────
 
 def run_report():
-    print(f"Report type: {REPORT_TYPE}")
-
     print("Fetching Redash data...")
     rows = fetch_redash()
     print(f"Got {len(rows)} rows")
 
-    message = build_report(rows, REPORT_TYPE)
+    message = build_report(rows)
 
-    if REPORT_TYPE == "9am":
-        print("Posting new Slack message (9:30 AM effort report)")
-        ts = post_slack(message)
-        with open(THREAD_FILE, "w") as f:
-            f.write(ts)
-        print(f"Posted. Thread ts: {ts}")
-    else:
-        print(f"Replying in thread (4 PM effort report)")
-        try:
-            ts = find_9am_thread_ts()
-            post_slack(message, ts)
-            print(f"Replied in thread: {ts}")
-        except Exception as e:
-            print(f"Warning: Could not find 9:30 AM thread ({e}). Posting as new message.")
-            ts = post_slack(message)
-            print(f"Posted as new message. ts: {ts}")
+    print("Posting Slack message...")
+    ts = post_slack(message)
+    print(f"Posted. ts: {ts}")
 
 
 if __name__ == "__main__":
