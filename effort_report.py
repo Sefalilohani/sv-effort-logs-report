@@ -20,12 +20,11 @@ REDASH_URL = (
     "https://redash.springworks.in/queries/1493"
     "?p_Client_name=%5B%22SELECT%20id%20FROM%20company%20WHERE%20id%20not%20in%20%2828%2C%2089%2C%2074%29%20and%20deleted_at%20is%20NULL%22%5D"
     "&p_Custom_Check_Type=%5B%22adverse_media_check%22%2C%22corporate_affiliation_check%22%2C%22directorship_check%22%2C%22do_not_use_education_check%22%2C%22economic_default_check%22%2C%22employment_details%22%2C%22face_match%22%2C%22facis_level_3%22%2C%22form_16%22%2C%22form_26as%22%2C%22gap_review%22%2C%22general_service_administration_check%22%2C%22medical_test_electrocardiogram%22%2C%22medical_test_package_a%22%2C%22medical_test_package_e%22%2C%22medical_test_package_f%22%2C%22medical_test_pulmonary_function_test%22%2C%22medical_test_ultrasound_abdomen%22%2C%22office_of_foreign_assets_control_ofac_check%22%2C%22oig_exclusions%22%2C%22other%22%2C%22overlap_check%22%2C%22personal_reference_check%22%2C%22personal_reference_check_2%22%2C%22police_clearance_certificate%22%2C%22political_affiliation_check%22%2C%22resume_review%22%2C%22right_to_work_india%22%2C%22social_media_check%22%2C%22social_media_lite%22%2C%22universal_account_number_check%22%5D"
-    "&p_Min_Days_Since_Effort=14"
+    "&p_Min_Days_Since_Effort=3"
     "&p_Net_TAT=%5B%22%2714%2B%28Black%29%27%22%5D"
     "&p_Quick_Check=%5B%22all%22%5D"
-    "&p_Task_Type=%5B%22ALL%22%5D"
     "&p_result_limit=4000"
-    "#2555"
+    "#2553"
 )
 
 # ── HELPERS ────────────────────────────────────────────────────
@@ -64,7 +63,7 @@ def fetch_redash():
                 "universal_account_number_check"
             ],
             "Task_Type": ["ALL"], 
-            "Min_Days_Since_Effort": 14,
+            "Min_Days_Since_Effort": 3,
             "Net_TAT": ["'14+(Black)'"],
             "result_limit": 4000
         },
@@ -127,53 +126,52 @@ def post_slack(text, thread_ts=None):
 # ── BUILD PIVOT TABLE ──────────────────────────────────────────
 
 def build_pivot_table(rows):
-    # Aggregate raw rows into pivot: Client Priority x Check Type
-    pivot = defaultdict(lambda: defaultdict(int))
-    from_dates = []
+      pivot = defaultdict(lambda: defaultdict(int))
+      from_dates = []
 
-    for row in rows:
-        priority = row.get("Client Priority") or "Unknown"
-        check_type = row.get("Check Type") or "Unknown"
-        pivot[priority][check_type] += 1
+      for row in rows:
+          severity = row.get("New Severity") or "Unknown"
+          check_type = row.get("Check Type") or "Unknown"
+          pivot[severity][check_type] += 1
 
-        raw_date = row.get("Last Effort Log Date")
-        if raw_date:
-            try:
-                dt = datetime.strptime(str(raw_date)[:19], "%Y-%m-%dT%H:%M:%S")
-                from_dates.append(dt)
-            except ValueError:
-                pass
+          raw_date = row.get("Last Effort Log Date")
+          if raw_date:
+              try:
+                  dt = datetime.strptime(str(raw_date)[:19], "%Y-%m-%dT%H:%M:%S")
+                  from_dates.append(dt)
+              except ValueError:
+                  pass
 
-    from_date = min(from_dates) if from_dates else None
+      from_date = min(from_dates) if from_dates else None
 
-    priorities = sorted(pivot.keys())
-    check_types = sorted(set(ct for p in pivot.values() for ct in p.keys()))
+      severities = sorted(pivot.keys())
+      check_types = sorted(set(ct for s in pivot.values() for ct in s.keys()))
 
-    priority_totals = {p: sum(pivot[p].values()) for p in priorities}
-    col_totals = {ct: sum(pivot[p].get(ct, 0) for p in priorities) for ct in check_types}
-    grand_total = sum(priority_totals.values())
+      severity_totals = {s: sum(pivot[s].values()) for s in severities}
+      col_totals = {ct: sum(pivot[s].get(ct, 0) for s in severities) for ct in check_types}
+      grand_total = sum(severity_totals.values())
 
-    p_width = 16
-    ct_width = max(9, max(len(ct) for ct in check_types) + 2)
+      row_width = 16
+      ct_width = max(9, max(len(ct) for ct in check_types) + 2)
 
-    header = f"{'Client Priority':<{p_width}}" + "".join(f"{ct:>{ct_width}}" for ct in check_types) + f"{'Total':>8}"
-    separator = "-" * len(header)
+      header = f"{'New Severity':<{row_width}}" + "".join(f"{ct:>{ct_width}}" for ct in check_types) + f"{'Total':>8}"
+      separator = "-" * len(header)
 
-    lines = ["```", header, separator]
-    for p in priorities:
-        line = f"{p:<{p_width}}"
-        for ct in check_types:
-            val = pivot[p].get(ct, 0)
-            line += f"{val if val else '-':>{ct_width}}"
-        line += f"{priority_totals[p]:>8}"
-        lines.append(line)
+      lines = ["```", header, separator]
+      for s in severities:
+          line = f"{s:<{row_width}}"
+          for ct in check_types:
+              val = pivot[s].get(ct, 0)
+              line += f"{val if val else '-':>{ct_width}}"
+          line += f"{severity_totals[s]:>8}"
+          lines.append(line)
 
-    lines.append(separator)
-    totals_line = f"{'Total':<{p_width}}" + "".join(f"{col_totals[ct]:>{ct_width}}" for ct in check_types) + f"{grand_total:>8}"
-    lines.append(totals_line)
-    lines.append("```")
+      lines.append(separator)
+      totals_line = f"{'Total':<{row_width}}" + "".join(f"{col_totals[ct]:>{ct_width}}" for ct in check_types) + f"{grand_total:>8}"
+      lines.append(totals_line)
+      lines.append("```")
 
-    return "\n".join(lines), grand_total, from_date
+      return "\n".join(lines), grand_total, from_date
 
 # ── BUILD REPORT ───────────────────────────────────────────────
 
@@ -189,7 +187,7 @@ def build_report(rows):
 
     text = (
         f"{heading}\n"
-        f"*Min. 14 Days Since Last Effort | NET TAT — 14+ days*\n"
+        f"*Min. 3 Days Since Last Effort | NET TAT — 14+ days*\n"
         f"*From Date: {from_date_str}*\n\n"
         f"{table_text}\n\n"
         f"*Total Checks: {grand_total}*\n"
